@@ -1,0 +1,1 @@
+import hashlib; hashlib.md5(b"data").hexdigest()
