@@ -9,12 +9,17 @@
 
 #include "pwtp/cases/common/Base64.h"
 
+// NOTE: Base64 must be a real implementation. If pwtp/cases/common/Base64.h
+// provides placeholder passthroughs, replace it with a proper Base64 codec.
+// STRICT_PQ: No version prefixes are used in the envelope format. Decryptors
+// MUST reject legacy inputs explicitly (e.g., those starting with "v1:").
 namespace pwtp::cases::symmetric::aes_cbc_no_mac_128_192_256 {
 
 // An envelope is a serialized payload that bundles metadata with ciphertext.
 
-constexpr size_t KEY_BYTES = 24;
-constexpr size_t IV_BYTES = 16;
+constexpr size_t KEY_BYTES = 32;
+constexpr size_t IV_BYTES = 12;
+constexpr size_t TAG_BYTES = 16;
 
 // Converts UTF-8 text into bytes.
 static std::vector<unsigned char> toBytes(const std::string& value) {
@@ -34,7 +39,9 @@ static std::vector<unsigned char> concat(const std::vector<unsigned char>& a,
 // Initializes key material and instance state.
 EnvelopeCipher::EnvelopeCipher() {
     encryption_key_.resize(KEY_BYTES);
-    RAND_bytes(encryption_key_.data(), static_cast<int>(encryption_key_.size()));
+    if (RAND_bytes(encryption_key_.data(), static_cast<int>(encryption_key_.size())) != 1) {
+        throw std::runtime_error("Random key generation failed");
+    }
 }
 
 // Encrypts the input and returns a base64 payload.
@@ -42,16 +49,29 @@ std::string EnvelopeCipher::encrypt(const std::string& value) {
     auto input = toBytes(value);
 
     auto iv = nextIv(value);
+    if (iv.size() != IV_BYTES) {
+        throw std::runtime_error("IV length invalid; expected 12 bytes");
+    }
+    if (encryption_key_.size() != KEY_BYTES) {
+        throw std::runtime_error("Key length invalid; expected 32 bytes");
+    }
     auto cipherText = encryptBytes(input, iv);
+    if (cipherText.size() < TAG_BYTES) {
+        throw std::runtime_error("Ciphertext too small; TAG missing");
+    }
+    // STRICT_PQ: Ciphertext layout is [IV(12) || CT || TAG(16)] with no version prefix.
+    // Legacy envelopes like 'v1:' + base64(...) MUST be rejected by decrypt callers.
     // Assemble the payload components for encoding.
     auto payload = concat(iv, cipherText);
-    return std::string("v1:") + base64Encode(payload);
+    return base64Encode(payload);
 }
 
 // Returns the IV for this operation.
 std::vector<unsigned char> EnvelopeCipher::nextIv(const std::string&) const {
     std::vector<unsigned char> iv(IV_BYTES);
-    RAND_bytes(iv.data(), static_cast<int>(iv.size()));
+    if (RAND_bytes(iv.data(), static_cast<int>(iv.size())) != 1) {
+        throw std::runtime_error("IV generation failed");
+    }
     return iv;
 }
 
@@ -62,12 +82,20 @@ std::vector<unsigned char> EnvelopeCipher::encryptBytes(
     if (!ctx) {
         throw std::runtime_error("Cipher context not available");
     }
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_192_cbc(), nullptr, encryption_key_.data(), iv.data()) !=
-        1) {
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         throw std::runtime_error("Cipher init failed");
     }
-    std::vector<unsigned char> out(input.size() + EVP_CIPHER_block_size(EVP_aes_192_cbc()));
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(iv.size()), nullptr) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("IV length set failed");
+    }
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, encryption_key_.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Cipher key/iv set failed");
+    }
+    std::vector<unsigned char> out(input.size());
     int out_len = 0;
     int total = 0;
     if (EVP_EncryptUpdate(ctx, out.data(), &out_len, input.data(),
@@ -81,9 +109,16 @@ std::vector<unsigned char> EnvelopeCipher::encryptBytes(
         throw std::runtime_error("Cipher finalize failed");
     }
     total += out_len;
+    std::vector<unsigned char> tag(TAG_BYTES);
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
+                            static_cast<int>(tag.size()), tag.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Tag retrieval failed");
+    }
     EVP_CIPHER_CTX_free(ctx);
     out.resize(total);
-    return out;
+    std::vector<unsigned char> out_with_tag = concat(out, tag);
+    return out_with_tag;
 }
 
 }  // namespace pwtp::cases::symmetric::aes_cbc_no_mac_128_192_256
