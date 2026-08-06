@@ -1,1 +1,1 @@
-import hashlib; hashlib.md5(b"data").hexdigest()
+import hashlib; hashlib.sha512(b"data").hexdigest()
